@@ -1,0 +1,435 @@
+"""LangChain chat-model adapter for the Claude Agent SDK.
+
+Bridges the Claude Code subscription (no ANTHROPIC_API_KEY required) into
+the LangChain ``BaseChatModel`` surface that TradingAgents expects from
+``tradingagents.llm_clients.factory.create_llm_client``.
+
+Phase 2b adds a LangChain-tool -> SDK-MCP bridge: ``bind_tools`` returns
+a model wrapper that registers the tools as an in-process MCP server, and
+the SDK runs the full tool-use loop inside ``_aquery``. The final
+AIMessage carries no ``tool_calls`` so LangGraph's ToolNode never fires
+for analyst nodes — they receive one complete report.
+``with_structured_output`` still raises so the existing
+``bind_structured`` helper falls back to free-text for
+manager/trader/portfolio.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import logging
+from typing import Any, List, Optional
+
+from langchain_core.callbacks import CallbackManagerForLLMRun
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+
+from .base_client import BaseLLMClient
+
+logger = logging.getLogger(__name__)
+
+
+_KNOWN_MODELS = {
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+}
+
+
+# Appended to the system prompt only when ``bound_tools`` is set. Without
+# this, the SDK loop returns the model's running commentary (e.g.
+# "I'll fetch X", "Data retrieved, now computing Y") concatenated with
+# the final answer because every intermediate ``AssistantMessage`` carries
+# narration text. Routing through analyst nodes that expect a single
+# polished report otherwise pollutes the report header.
+_TOOL_SILENCE_INSTRUCTION = (
+    "\n\n## Tool-use output rules\n"
+    "When you call tools, do not narrate or pre-announce them. No "
+    "\"I'll fetch X\", \"Data retrieved\", or \"Now computing Y\" prose. "
+    "Stay silent across all intermediate tool turns; emit text only in "
+    "your final turn, and emit ONLY the polished final response — no "
+    "preamble describing the work you just did."
+)
+
+
+def _flatten_messages(messages: List[BaseMessage]) -> tuple[Optional[str], str]:
+    """Collapse a LangChain message list into ``(system_prompt, user_text)``.
+
+    TradingAgents calls ``llm.invoke(single_string)`` which LangChain
+    wraps as ``[HumanMessage(...)]``; this helper also handles the
+    SystemMessage + HumanMessage shape that ChatPromptTemplate emits.
+    Multi-turn fidelity is not a goal in phase 1.
+    """
+    system_parts: list[str] = []
+    body_parts: list[str] = []
+    for msg in messages:
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        if isinstance(msg, SystemMessage):
+            system_parts.append(content)
+        elif isinstance(msg, AIMessage):
+            body_parts.append(f"[Previous assistant turn]\n{content}")
+        else:
+            body_parts.append(content)
+    system = "\n\n".join(p for p in system_parts if p) or None
+    body = "\n\n".join(p for p in body_parts if p)
+    return system, body
+
+
+def _run_async(coro):
+    """Run an async coroutine from sync code, even inside a running loop.
+
+    LangGraph's compiled graph defaults to sync ``.invoke`` (no running
+    loop), but downstream callers may wrap us in one — escape to a
+    worker thread when that happens so the SDK's async generator can
+    own its own loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+class ClaudeCodeChatModel(BaseChatModel):
+    """LangChain chat model backed by the Claude Code subscription.
+
+    Each call shells out to the local ``claude`` CLI via
+    ``claude_agent_sdk.query``; the CLI's OAuth token authenticates
+    against the user's Pro/Max plan, sidestepping ANTHROPIC_API_KEY.
+    """
+
+    model: str = "claude-sonnet-4-6"
+    # Set by ``bind_tools(tools)``; when non-None each ``_aquery`` call
+    # spins up an SDK MCP server exposing these LangChain tools so the
+    # model can call them inside its agent loop.
+    bound_tools: Optional[List[Any]] = None
+
+    model_config = {"protected_namespaces": (), "arbitrary_types_allowed": True}
+
+    @property
+    def _llm_type(self) -> str:
+        return "claude-code"
+
+    @property
+    def _identifying_params(self) -> dict:
+        return {"model": self.model, "provider": "claude-code"}
+
+    async def _aquery(self, system_prompt: Optional[str], user_text: str) -> str:
+        # Lazy import keeps simply loading this module cheap when the SDK
+        # is absent (and lets the install-error point at the right place).
+        try:
+            from claude_agent_sdk import ClaudeAgentOptions
+        except ImportError as e:
+            raise ImportError(
+                "claude-agent-sdk is required for the 'claude-code' provider. "
+                "Install it with: pip install claude-agent-sdk"
+            ) from e
+
+        # Pure-chat isolation — strip everything that makes Claude Code
+        # *Claude Code*. ``allowed_tools=[]`` alone is not enough: the
+        # built-in tool registry and the user's skills are still loaded,
+        # and the model autonomously tries to call them and leaks "live
+        # data fetch blocked by permissions" prose into the output (we
+        # caught this in mini_graph #1).
+        options_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "tools": [],               # disable every built-in tool
+            "skills": [],              # hide host skill registry from the model
+            "setting_sources": [],     # ignore user/project/local settings.json
+            "strict_mcp_config": True, # ignore .mcp.json + plugin MCP servers
+            # Caller-provided SystemMessage wins; otherwise pin a minimal
+            # prompt so we don't inherit the Claude Code agent preset.
+            "system_prompt": system_prompt
+            or "You are a helpful assistant. Reply with the requested content directly.",
+        }
+
+        # Phase 2b: when tools were bound via ``bind_tools()``, expose them
+        # to the model via an in-process SDK MCP server.
+        # ``bypassPermissions`` auto-allows MCP tool calls without
+        # prompting; built-in tools stay disabled by ``tools=[]`` above so
+        # this only loosens MCP scope. The silence-during-tools directive
+        # keeps intermediate "I'll fetch X / Data retrieved" narration out
+        # of the final AssistantMessage text downstream nodes consume.
+        if self.bound_tools:
+            options_kwargs["mcp_servers"] = {
+                "tradingagents": self._build_mcp_server(self.bound_tools),
+            }
+            options_kwargs["permission_mode"] = "bypassPermissions"
+            options_kwargs["system_prompt"] = (
+                options_kwargs["system_prompt"] + _TOOL_SILENCE_INSTRUCTION
+            )
+
+        options = ClaudeAgentOptions(**options_kwargs)
+
+        # First attempt. Most calls return cleanly here.
+        text, last_result = await self._run_query(options, user_text)
+
+        # Some socket / upstream-API hiccups manifest as the CLI emitting
+        # an error-only ``"API Error: ..."`` AssistantMessage TextBlock
+        # right before tearing down — partial-text recovery picks it up
+        # and treats it as success. Detect that shape and retry once;
+        # raise loudly on double failure so corrupted analyst reports
+        # don't silently poison downstream nodes (we caught the news /
+        # fundamentals reports getting a 134-char "API Error..." string
+        # in the first full-graph run).
+        if self._looks_like_error_text(text, last_result):
+            logger.warning(
+                "claude-code returned error-only %d-char text on attempt 1 "
+                "(%r); retrying once.",
+                len(text),
+                text[:120],
+            )
+            text2, last_result2 = await self._run_query(options, user_text)
+            if self._looks_like_error_text(text2, last_result2):
+                raise RuntimeError(
+                    "claude-code returned error-only text on both attempts. "
+                    f"First ({len(text)} chars): {text!r}. "
+                    f"Second ({len(text2)} chars): {text2!r}."
+                )
+            text = text2
+
+        return text
+
+    async def _run_query(
+        self, options: Any, user_text: str
+    ) -> tuple[str, Any]:
+        """Single SDK roundtrip with partial-text recovery + usage logging.
+
+        Returns ``(stripped_text, last_result_message_or_None)``. Caller
+        uses ``_looks_like_error_text`` to decide whether to retry.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ResultMessage,
+            TextBlock,
+            query,
+        )
+
+        parts: list[str] = []
+        last_result: Any = None
+        try:
+            async for msg in query(prompt=user_text, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            parts.append(block.text)
+                elif isinstance(msg, ResultMessage):
+                    last_result = msg
+        except Exception as exc:
+            # ``is_error=True`` with ``subtype="success"`` is the documented
+            # signal for an upstream API failure (429/500/529) — see the
+            # ``api_error_status`` field on ResultMessage in SDK 0.2.87+.
+            # When that fires after assistant text has already streamed,
+            # treat the partial reply as a soft success here; the retry
+            # gate in ``_aquery`` decides whether to escalate.
+            if parts:
+                api_err = getattr(last_result, "api_error_status", None)
+                logger.warning(
+                    "claude-code post-stream finalization error suppressed "
+                    "(%s, api_error_status=%s); using %d-char partial text.",
+                    exc, api_err, sum(len(p) for p in parts),
+                )
+            else:
+                if last_result is not None:
+                    self._log_usage(last_result)
+                raise
+
+        if last_result is not None:
+            self._log_usage(last_result)
+
+        return "".join(parts).strip(), last_result
+
+    @staticmethod
+    def _looks_like_error_text(text: str, last_result: Any) -> bool:
+        """Heuristic for "this looks like a CLI error notice, not a real reply".
+
+        A short response that opens with a known error marker is treated
+        as a soft failure worth one retry. Hard rate limits
+        (``api_error_status=429``) are exempt — backing off immediately
+        is wasted quota, and Claude's rate-limit window is measured in
+        minutes, not retries.
+        """
+        if not text:
+            return False
+        if getattr(last_result, "api_error_status", None) == 429:
+            return False
+        if len(text) > 400:
+            return False
+        head = text.lstrip()
+        return head.startswith((
+            "API Error:",
+            "API error:",
+            "Error:",
+            "Internal server error",
+            "Claude Code returned an error",
+        ))
+
+    def _log_usage(self, result_msg: Any) -> None:
+        """Emit a structured per-call usage line so operators can size the
+        subscription against real traffic. ``cache_create`` is the most
+        important field — the agent-loop preamble dominates first-touch
+        cost and shrinks dramatically on cache hits within the same window.
+        """
+        usage = getattr(result_msg, "usage", None) or {}
+        api_err = getattr(result_msg, "api_error_status", None)
+        extra = f" api_error_status={api_err}" if api_err else ""
+        logger.info(
+            "claude-code usage: model=%s duration=%.2fs api_duration=%.2fs "
+            "turns=%s input=%s cache_create=%s cache_read=%s output=%s%s",
+            self.model,
+            (getattr(result_msg, "duration_ms", 0) or 0) / 1000,
+            (getattr(result_msg, "duration_api_ms", 0) or 0) / 1000,
+            getattr(result_msg, "num_turns", 0),
+            usage.get("input_tokens", 0),
+            usage.get("cache_creation_input_tokens", 0),
+            usage.get("cache_read_input_tokens", 0),
+            usage.get("output_tokens", 0),
+            extra,
+        )
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        system_prompt, user_text = _flatten_messages(messages)
+        text = _run_async(self._aquery(system_prompt, user_text))
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content=text))]
+        )
+
+    async def _agenerate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager=None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        system_prompt, user_text = _flatten_messages(messages)
+        text = await self._aquery(system_prompt, user_text)
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content=text))]
+        )
+
+    def bind_tools(self, tools, **kwargs):
+        # Phase 2b: copy the model with ``bound_tools`` so the next
+        # ``_aquery`` registers them as an SDK MCP server. Empty input
+        # clears a prior binding (matches LangChain's convention).
+        return self.__class__(
+            model=self.model,
+            bound_tools=list(tools) if tools else None,
+        )
+
+    @staticmethod
+    def _build_mcp_server(tools: List[Any]) -> Any:
+        """Wrap each LangChain tool as an ``SdkMcpTool`` and create an
+        in-process MCP server exposing the lot under one namespace.
+        """
+        from claude_agent_sdk import create_sdk_mcp_server
+
+        return create_sdk_mcp_server(
+            name="tradingagents",
+            version="0.1.0",
+            tools=[ClaudeCodeChatModel._wrap_langchain_tool(t) for t in tools],
+        )
+
+    @staticmethod
+    def _wrap_langchain_tool(tool: Any) -> Any:
+        """Convert a LangChain ``BaseTool`` into an ``SdkMcpTool``.
+
+        The handler routes the model's arg dict through ``tool.ainvoke``
+        (which transparently runs sync ``_run`` implementations in a
+        worker thread) and wraps the return value in MCP's
+        ``{"content":[{"type":"text","text":...}]}`` envelope. Exceptions
+        surface as ``is_error=True`` so the model sees the failure and
+        can self-recover instead of hanging.
+        """
+        from claude_agent_sdk import SdkMcpTool
+
+        name = tool.name
+        description = getattr(tool, "description", "") or ""
+        input_schema = ClaudeCodeChatModel._extract_input_schema(tool)
+
+        async def handler(args: dict) -> dict:
+            try:
+                result = await tool.ainvoke(args)
+            except Exception as exc:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{name} failed: {type(exc).__name__}: {exc}",
+                        }
+                    ],
+                    "is_error": True,
+                }
+            text = result if isinstance(result, str) else str(result)
+            return {"content": [{"type": "text", "text": text}]}
+
+        return SdkMcpTool(
+            name=name,
+            description=description,
+            input_schema=input_schema,
+            handler=handler,
+        )
+
+    @staticmethod
+    def _extract_input_schema(tool: Any) -> dict:
+        """Pull a JSON-Schema dict from a LangChain tool's Pydantic model.
+
+        Prefers ``tool_call_schema`` (LangChain's normalized schema used
+        for tool-call formatting on Anthropic / OpenAI), then falls back
+        to ``args_schema``. Returns an empty object schema when neither
+        is defined so tools without arguments still register cleanly.
+        """
+        schema_cls = (
+            getattr(tool, "tool_call_schema", None)
+            or getattr(tool, "args_schema", None)
+        )
+        if schema_cls is None:
+            return {"type": "object", "properties": {}}
+        if hasattr(schema_cls, "model_json_schema"):
+            return schema_cls.model_json_schema()
+        if hasattr(schema_cls, "schema"):
+            return schema_cls.schema()  # Pydantic v1 fallback
+        return {"type": "object", "properties": {}}
+
+    def with_structured_output(self, schema, **kwargs):
+        # Phase 1 has no JSON-schema/tool-calling support. The project's
+        # ``bind_structured`` helper catches NotImplementedError and
+        # transparently degrades the manager/trader/portfolio agents to
+        # free-text generation — so raising here is the correct hook.
+        raise NotImplementedError(
+            "ClaudeCodeChatModel does not support with_structured_output() "
+            "in phase 1; tradingagents will fall back to free-text generation."
+        )
+
+
+class ClaudeCodeClient(BaseLLMClient):
+    """Factory wrapper exposed by ``create_llm_client('claude-code', ...)``."""
+
+    provider = "claude-code"
+
+    def __init__(self, model: str, base_url: Optional[str] = None, **kwargs):
+        if base_url is not None:
+            raise ValueError(
+                "The 'claude-code' provider has no base_url — endpoint and "
+                "auth are owned by the local `claude` CLI's OAuth session."
+            )
+        super().__init__(model, base_url=None, **kwargs)
+
+    def get_llm(self) -> Any:
+        self.warn_if_unknown_model()
+        return ClaudeCodeChatModel(model=self.model)
+
+    def validate_model(self) -> bool:
+        return self.model in _KNOWN_MODELS
