@@ -1,12 +1,53 @@
 """Config isolation: get/set must not leak nested-dict references."""
 
 import copy
+import os
 import unittest
+from unittest import mock
 
 import pytest
 
 import tradingagents.default_config as default_config
 from tradingagents.dataflows.config import get_config, set_config
+
+
+def _base_vendor_config():
+    return {
+        "data_vendors": {
+            "core_stock_apis": "yfinance",
+            "technical_indicators": "yfinance",
+            "fundamental_data": "yfinance",
+            "news_data": "yfinance",
+        }
+    }
+
+
+@pytest.mark.unit
+def test_vendor_env_override_sets_only_named_category():
+    with mock.patch.dict(
+        os.environ,
+        {"TRADINGAGENTS_VENDOR_FUNDAMENTAL_DATA": "fmp,yfinance"},
+        clear=False,
+    ):
+        cfg = default_config._apply_env_overrides(_base_vendor_config())
+
+    # The named category picks up the env value (comma chain preserved)...
+    assert cfg["data_vendors"]["fundamental_data"] == "fmp,yfinance"
+    # ...and the others keep their defaults.
+    assert cfg["data_vendors"]["core_stock_apis"] == "yfinance"
+    assert cfg["data_vendors"]["news_data"] == "yfinance"
+
+
+@pytest.mark.unit
+def test_vendor_env_override_blank_is_ignored():
+    with mock.patch.dict(
+        os.environ,
+        {"TRADINGAGENTS_VENDOR_NEWS_DATA": ""},
+        clear=False,
+    ):
+        cfg = default_config._apply_env_overrides(_base_vendor_config())
+
+    assert cfg["data_vendors"]["news_data"] == "yfinance"
 
 
 @pytest.mark.unit

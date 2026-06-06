@@ -20,6 +20,17 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
 }
 
+# Per-category data-vendor overrides. These map into the nested
+# ``data_vendors`` dict rather than a top-level key. The value is a vendor
+# name or a comma-separated priority chain (e.g. "fmp,yfinance"); the routing
+# layer splits on commas, so no coercion is needed — the raw string is used.
+_VENDOR_ENV_OVERRIDES = {
+    "TRADINGAGENTS_VENDOR_CORE_STOCK_APIS":      "core_stock_apis",
+    "TRADINGAGENTS_VENDOR_TECHNICAL_INDICATORS": "technical_indicators",
+    "TRADINGAGENTS_VENDOR_FUNDAMENTAL_DATA":     "fundamental_data",
+    "TRADINGAGENTS_VENDOR_NEWS_DATA":            "news_data",
+}
+
 
 def _coerce(value: str, reference):
     """Coerce env-var string to the type of the existing default value."""
@@ -39,6 +50,15 @@ def _apply_env_overrides(config: dict) -> dict:
         if raw is None or raw == "":
             continue
         config[key] = _coerce(raw, config.get(key))
+
+    # Nested per-category data-vendor overrides.
+    vendors = config.get("data_vendors")
+    if isinstance(vendors, dict):
+        for env_var, category in _VENDOR_ENV_OVERRIDES.items():
+            raw = os.environ.get(env_var)
+            if raw is None or raw == "":
+                continue
+            vendors[category] = raw.strip()
     return config
 
 
