@@ -14,12 +14,15 @@ from .symbol_utils import normalize_symbol, NoMarketDataError
 logger = logging.getLogger(__name__)
 
 
-def yf_retry(func, max_retries=3, base_delay=2.0):
+def yf_retry(func, max_retries=5, base_delay=2.0):
     """Execute a yfinance call with exponential backoff on rate limits.
 
     yfinance raises YFRateLimitError on HTTP 429 responses but does not
     retry them internally. This wrapper adds retry logic specifically
     for rate limits. Other exceptions propagate immediately.
+
+    The default of 5 retries backs off 2+4+8+16+32 ≈ 62s, enough to outlast
+    a short Yahoo cooldown; the original 3 (≈14s) routinely expired mid-block.
     """
     for attempt in range(max_retries + 1):
         try:
@@ -31,6 +34,29 @@ def yf_retry(func, max_retries=3, base_delay=2.0):
                 time.sleep(delay)
             else:
                 raise
+
+
+def _download_was_rate_limited(symbol: str) -> bool:
+    """True if yfinance recorded a rate-limit error for ``symbol`` last download.
+
+    yfinance often swallows a 429 into an empty frame instead of raising —
+    while stashing the cause in ``yfinance.shared._ERRORS`` (the same dict it
+    prints "1 Failed download … YFRateLimitError" from). Inspect it so a
+    transient rate limit (worth retrying) is told apart from a genuinely
+    empty/delisted symbol (which must fail fast, not burn the retry budget).
+    """
+    try:
+        from yfinance import shared
+
+        errors = getattr(shared, "_ERRORS", None) or {}
+        msg = errors.get(symbol) or errors.get(symbol.upper()) or ""
+    except Exception:
+        return False
+    text = str(msg).lower()
+    return any(
+        tok in text
+        for tok in ("rate limit", "too many requests", "429", "yfratelimit")
+    )
 
 
 def _ensure_date_column(data: pd.DataFrame) -> pd.DataFrame:
@@ -100,14 +126,32 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             data = cached
 
     if data is None:
-        downloaded = yf_retry(lambda: yf.download(
-            canonical,
-            start=start_str,
-            end=end_str,
-            multi_level_index=False,
-            progress=False,
-            auto_adjust=True,
-        ))
+        def _download():
+            df = yf.download(
+                canonical,
+                start=start_str,
+                end=end_str,
+                multi_level_index=False,
+                progress=False,
+                auto_adjust=True,
+            )
+            # yfinance sometimes swallows a 429 into an empty frame instead of
+            # raising; re-raise so yf_retry's backoff applies. A genuinely empty
+            # result (delisted/invalid symbol) falls through to NoMarketDataError
+            # below without consuming the retry budget.
+            if (df is None or df.empty) and _download_was_rate_limited(canonical):
+                raise YFRateLimitError()
+            return df
+
+        try:
+            downloaded = yf_retry(_download)
+        except YFRateLimitError as exc:
+            # Retries exhausted against an active Yahoo cooldown. Surface as a
+            # no-data condition so callers degrade gracefully (vendor fallback /
+            # placeholder) rather than crashing on a vendor-specific exception.
+            raise NoMarketDataError(
+                symbol, canonical, "Yahoo Finance rate limited; retries exhausted"
+            ) from exc
         downloaded = _ensure_date_column(downloaded.reset_index())
         # Only cache real data — never persist an empty frame.
         if downloaded.empty or "Close" not in downloaded.columns:
