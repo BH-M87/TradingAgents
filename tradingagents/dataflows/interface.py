@@ -23,6 +23,7 @@ from .alpha_vantage import (
     get_global_news as get_alpha_vantage_global_news,
 )
 from .alpha_vantage_common import AlphaVantageRateLimitError
+from .vendor_errors import VendorRateLimitError
 from .symbol_utils import NoMarketDataError
 
 # Configuration and routing logic
@@ -159,8 +160,8 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Rate limits: try the next vendor
+        except VendorRateLimitError:
+            continue  # Rate limits / plan-gated endpoints: try the next vendor
         except NoMarketDataError as e:
             last_no_data = e  # No data here; another vendor may have it
             continue
