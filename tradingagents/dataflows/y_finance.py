@@ -13,42 +13,47 @@ def get_YFin_data_online(
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ):
 
+    # Validate date formats early (raises ValueError on malformed input).
     datetime.strptime(start_date, "%Y-%m-%d")
     datetime.strptime(end_date, "%Y-%m-%d")
 
     # Resolve broker/forex symbols to Yahoo's convention (XAUUSD+ -> GC=F).
     canonical = normalize_symbol(symbol)
-    ticker = yf.Ticker(canonical)
 
-    # Fetch historical data for the specified date range
-    data = yf_retry(lambda: ticker.history(start=start_date, end=end_date))
+    # Reuse the cached OHLCV frame that load_ohlcv maintains (shared with the
+    # verified snapshot and indicator paths) instead of issuing a separate
+    # yf.Ticker.history download. This collapses the market analyst's three
+    # price fetches into a single network call per symbol — the main driver of
+    # Yahoo rate-limiting — and keeps this tool consistent with the snapshot
+    # (same source, so the two outputs can never disagree). A bad/delisted
+    # symbol or an exhausted rate-limit surfaces here as NoMarketDataError,
+    # which the routing layer turns into a single "no data" signal.
+    data = load_ohlcv(symbol, end_date)
 
-    # Empty result means the symbol is unknown/delisted. Raise a typed error
-    # instead of returning prose: the routing layer turns it into a single
-    # unambiguous "no data" signal so the agent never fabricates a price.
-    if data.empty:
+    window = data[
+        (data["Date"] >= pd.to_datetime(start_date))
+        & (data["Date"] <= pd.to_datetime(end_date))
+    ].copy()
+    if window.empty:
         raise NoMarketDataError(
             symbol, canonical, f"no rows between {start_date} and {end_date}"
         )
 
-    # Remove timezone info from index for cleaner output
-    if data.index.tz is not None:
-        data.index = data.index.tz_localize(None)
-
-    # Round numerical values to 2 decimal places for cleaner display
-    numeric_columns = ["Open", "High", "Low", "Close", "Adj Close"]
-    for col in numeric_columns:
-        if col in data.columns:
-            data[col] = data[col].round(2)
-
-    # Convert DataFrame to CSV string
-    csv_string = data.to_csv()
+    # Round prices for cleaner display and emit the standard OHLCV columns,
+    # Date-indexed, to match this tool's prior CSV shape.
+    for col in ("Open", "High", "Low", "Close"):
+        if col in window.columns:
+            window[col] = window[col].round(2)
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in window.columns]
+    out = window.set_index("Date")[cols]
+    out.index = out.index.strftime("%Y-%m-%d")
+    csv_string = out.to_csv()
 
     # Add header information; note the resolved symbol when it differs so the
     # agent (and user) can see which instrument was actually priced.
     label = canonical if canonical == symbol.upper() else f"{canonical} (from {symbol})"
     header = f"# Stock data for {label} from {start_date} to {end_date}\n"
-    header += f"# Total records: {len(data)}\n"
+    header += f"# Total records: {len(window)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
     return header + csv_string
