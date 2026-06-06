@@ -1,11 +1,31 @@
 import os
 import re
 import json
+import ssl
 import pandas as pd
 from datetime import date, timedelta, datetime
 from typing import Annotated
 
 SavePathType = Annotated[str, "File path to save data. If None, data is not saved."]
+
+
+def make_verified_ssl_context() -> ssl.SSLContext:
+    """Return an SSL context that verifies certs against certifi's CA bundle.
+
+    The python.org macOS framework build ships without a populated CA store —
+    its default cert path doesn't exist until ``Install Certificates.command``
+    is run — so the stdlib default context fails every HTTPS verification with
+    ``CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate``.
+    certifi (a transitive dep of requests/yfinance, now declared directly)
+    always carries a usable bundle, so build the context from it. Fall back to
+    the stdlib default if certifi is somehow unavailable rather than crashing.
+    """
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 # Tickers can contain letters, digits, dot, dash, underscore, caret
 # (index symbols like ^GSPC), equals (futures like GC=F), and plus

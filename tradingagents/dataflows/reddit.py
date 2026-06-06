@@ -29,7 +29,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .utils import make_verified_ssl_context
+
 logger = logging.getLogger(__name__)
+
+# Verify TLS against certifi's bundle; the stdlib default context has no CA
+# store on the python.org macOS build and fails with CERTIFICATE_VERIFY_FAILED.
+_SSL_CONTEXT = make_verified_ssl_context()
 
 _API = "https://www.reddit.com/r/{sub}/search.json?{qs}"
 _RSS = "https://www.reddit.com/r/{sub}/search.rss?{qs}"
@@ -92,7 +98,7 @@ def _fetch_subreddit_rss(
     url = _RSS.format(sub=sub, qs=_search_qs(ticker, limit))
     req = Request(url, headers={"User-Agent": _UA})
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
             root = ET.fromstring(resp.read())
     except (HTTPError, URLError, TimeoutError, ET.ParseError) as exc:
         logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
@@ -125,7 +131,7 @@ def _fetch_subreddit(
     url = _API.format(sub=sub, qs=_search_qs(ticker, limit))
     req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
             payload = json.loads(resp.read())
         children = (payload.get("data") or {}).get("children") or []
         return [c.get("data", {}) for c in children if isinstance(c, dict)]

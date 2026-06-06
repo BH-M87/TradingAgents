@@ -21,10 +21,15 @@ from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .utils import make_verified_ssl_context
+
 logger = logging.getLogger(__name__)
 
 _API = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
+# Verify TLS against certifi's bundle; the stdlib default context has no CA
+# store on the python.org macOS build and fails with CERTIFICATE_VERIFY_FAILED.
+_SSL_CONTEXT = make_verified_ssl_context()
 
 
 def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.0) -> str:
@@ -38,7 +43,7 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
     url = _API.format(ticker=ticker.upper())
     req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
             data = json.loads(resp.read())
     except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
         logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
