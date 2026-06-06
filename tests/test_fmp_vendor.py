@@ -1,5 +1,6 @@
 """FMP vendor: client behavior, parsing, look-ahead filtering, routing fallback."""
 
+import json
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock, patch
@@ -131,3 +132,44 @@ def test_fmp_get_indicator_uses_fmp_ohlcv(monkeypatch):
     out = fmp_indicator.get_indicator("AAPL", "close_50_sma", "2024-02-29", 3)
     assert "## close_50_sma values from 2024-02-26 to 2024-02-29:" in out
     assert "50 SMA" in out
+
+
+@pytest.mark.unit
+def test_fmp_balance_sheet_filters_future_periods(monkeypatch):
+    from tradingagents.dataflows import fmp_fundamentals
+
+    reports = [
+        {"date": "2024-12-31", "totalAssets": 300},
+        {"date": "2024-03-31", "totalAssets": 200},
+        {"date": "2023-12-31", "totalAssets": 100},
+    ]
+    monkeypatch.setattr(
+        fmp_fundamentals, "_make_api_request", lambda endpoint, params=None: reports
+    )
+
+    out = fmp_fundamentals.get_balance_sheet("AAPL", freq="quarterly", curr_date="2024-06-30")
+    parsed = json.loads(out)
+    dates = [r["date"] for r in parsed]
+    assert dates == ["2024-03-31", "2023-12-31"]  # 2024-12-31 dropped
+
+
+@pytest.mark.unit
+def test_fmp_fundamentals_combines_profile(monkeypatch):
+    from tradingagents.dataflows import fmp_fundamentals
+
+    def fake_request(endpoint, params=None):
+        if endpoint == "profile":
+            return [{"symbol": "AAPL", "companyName": "Apple Inc."}]
+        if endpoint == "ratios":
+            return [{"peRatio": 30}]
+        if endpoint == "key-metrics":
+            return [{"marketCap": 1000}]
+        return []
+
+    monkeypatch.setattr(fmp_fundamentals, "_make_api_request", fake_request)
+
+    out = fmp_fundamentals.get_fundamentals("AAPL", curr_date="2024-06-30")
+    parsed = json.loads(out)
+    assert parsed["profile"]["companyName"] == "Apple Inc."
+    assert parsed["ratios"]["peRatio"] == 30
+    assert parsed["key_metrics"]["marketCap"] == 1000
