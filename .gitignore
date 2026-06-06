@@ -222,5 +222,6 @@ __marimo__/
 .env.enterprise
 reports/
 
-# claude
+# Claude
 .omc
+.claude/scheduled_tasks.lock
