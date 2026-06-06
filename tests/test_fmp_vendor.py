@@ -210,3 +210,12 @@ def test_fmp_insider_returns_json(monkeypatch):
 
     out = fmp_news.get_insider_transactions("AAPL")
     assert json.loads(out)[0]["transactionType"] == "P-Purchase"
+
+
+@pytest.mark.unit
+def test_fmp_registered_for_all_methods():
+    from tradingagents.dataflows.interface import VENDOR_LIST, VENDOR_METHODS
+
+    assert "fmp" in VENDOR_LIST
+    for method, vendors in VENDOR_METHODS.items():
+        assert "fmp" in vendors, f"{method} missing fmp implementation"
