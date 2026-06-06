@@ -173,3 +173,40 @@ def test_fmp_fundamentals_combines_profile(monkeypatch):
     assert parsed["profile"]["companyName"] == "Apple Inc."
     assert parsed["ratios"]["peRatio"] == 30
     assert parsed["key_metrics"]["marketCap"] == 1000
+
+
+@pytest.mark.unit
+def test_fmp_get_news_returns_json(monkeypatch):
+    from tradingagents.dataflows import fmp_news
+
+    articles = [{"symbol": "AAPL", "publishedDate": "2024-06-01 10:00:00", "title": "X"}]
+    monkeypatch.setattr(fmp_news, "_make_api_request", lambda endpoint, params=None: articles)
+
+    out = fmp_news.get_news("AAPL", "2024-05-01", "2024-06-30")
+    assert json.loads(out)[0]["title"] == "X"
+
+
+@pytest.mark.unit
+def test_fmp_global_news_filters_window(monkeypatch):
+    from tradingagents.dataflows import fmp_news
+
+    articles = [
+        {"publishedDate": "2024-06-05 10:00:00", "title": "in"},
+        {"publishedDate": "2024-05-01 10:00:00", "title": "out"},
+    ]
+    monkeypatch.setattr(fmp_news, "_make_api_request", lambda endpoint, params=None: articles)
+
+    out = fmp_news.get_global_news("2024-06-06", look_back_days=7, limit=50)
+    titles = [a["title"] for a in json.loads(out)]
+    assert titles == ["in"]
+
+
+@pytest.mark.unit
+def test_fmp_insider_returns_json(monkeypatch):
+    from tradingagents.dataflows import fmp_news
+
+    txns = [{"symbol": "AAPL", "transactionType": "P-Purchase"}]
+    monkeypatch.setattr(fmp_news, "_make_api_request", lambda endpoint, params=None: txns)
+
+    out = fmp_news.get_insider_transactions("AAPL")
+    assert json.loads(out)[0]["transactionType"] == "P-Purchase"
