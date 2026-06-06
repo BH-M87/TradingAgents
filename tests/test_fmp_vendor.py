@@ -206,6 +206,27 @@ def test_fmp_global_news_filters_window(monkeypatch):
 
 
 @pytest.mark.unit
+def test_fmp_global_news_none_args_use_config_defaults(monkeypatch):
+    # The tool wrapper passes look_back_days=None, limit=None to mean "use the
+    # configured default". FMP must substitute config values, not crash on
+    # timedelta(days=None) (mirrors the yfinance vendor's contract).
+    from tradingagents.dataflows import fmp_news
+
+    captured = {}
+
+    def fake_request(endpoint, params=None):
+        captured["params"] = params
+        return [{"publishedDate": "2024-06-05 10:00:00", "title": "in"}]
+
+    monkeypatch.setattr(fmp_news, "_make_api_request", fake_request)
+
+    out = fmp_news.get_global_news("2024-06-06", look_back_days=None, limit=None)
+    # Did not raise; used the configured article limit, not None.
+    assert captured["params"]["limit"] is not None
+    assert json.loads(out)[0]["title"] == "in"
+
+
+@pytest.mark.unit
 def test_fmp_insider_returns_json(monkeypatch):
     from tradingagents.dataflows import fmp_news
 

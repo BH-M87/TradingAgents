@@ -22,7 +22,6 @@ from .alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_global_news as get_alpha_vantage_global_news,
 )
-from .alpha_vantage_common import AlphaVantageRateLimitError
 from .fmp import (
     get_stock as get_fmp_stock,
     get_indicator as get_fmp_indicator,

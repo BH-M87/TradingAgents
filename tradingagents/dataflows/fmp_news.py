@@ -26,12 +26,25 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
     return json.dumps(articles, indent=2)
 
 
-def get_global_news(curr_date: str, look_back_days: int = 7, limit: int = 50) -> str:
+def get_global_news(
+    curr_date: str,
+    look_back_days: int = None,
+    limit: int = None,
+) -> str:
     """Return general market news within the look-back window as JSON.
 
     FMP's general-news endpoint is not date-filterable, so the window is
-    applied client-side on the ``publishedDate`` field.
+    applied client-side on the ``publishedDate`` field. ``look_back_days`` and
+    ``limit`` fall back to the configured ``global_news_lookback_days`` /
+    ``global_news_article_limit`` when ``None`` — the tool wrapper passes
+    ``None`` to mean "use the configured default" (matching the yfinance vendor).
     """
+    config = get_config()
+    if look_back_days is None:
+        look_back_days = config["global_news_lookback_days"]
+    if limit is None:
+        limit = config["global_news_article_limit"]
+
     articles = _make_api_request("news/general-latest", {"page": 0, "limit": limit})
     start_date = (
         datetime.strptime(curr_date, "%Y-%m-%d") - timedelta(days=look_back_days)
