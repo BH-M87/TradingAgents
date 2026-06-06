@@ -82,3 +82,30 @@ def test_fmp_symbol_normalizes():
 
     assert fmp_symbol("aapl+") == "AAPL"
     assert fmp_symbol("  msft ") == "MSFT"
+
+
+@pytest.mark.unit
+def test_fmp_get_stock_builds_csv(monkeypatch):
+    from tradingagents.dataflows import fmp_stock
+
+    rows = [
+        {"date": "2024-01-03", "open": 10.0, "high": 11.0, "low": 9.5, "close": 10.5, "volume": 1000},
+        {"date": "2024-01-02", "open": 10.2, "high": 11.2, "low": 9.7, "close": 10.7, "volume": 1100},
+    ]
+    monkeypatch.setattr(fmp_stock, "_make_api_request", lambda endpoint, params=None: rows)
+
+    out = fmp_stock.get_stock("AAPL", "2024-01-01", "2024-01-31")
+    assert "# Stock data for AAPL" in out
+    assert "2024-01-02" in out
+    assert "2024-01-03" in out
+    assert "Open,High,Low,Close,Volume" in out
+
+
+@pytest.mark.unit
+def test_fmp_get_stock_empty_raises_no_data(monkeypatch):
+    from tradingagents.dataflows import fmp_stock
+    from tradingagents.dataflows.symbol_utils import NoMarketDataError
+
+    monkeypatch.setattr(fmp_stock, "_make_api_request", lambda endpoint, params=None: [])
+    with pytest.raises(NoMarketDataError):
+        fmp_stock.get_stock("NOPE", "2024-01-01", "2024-01-31")
