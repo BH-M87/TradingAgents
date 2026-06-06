@@ -1,9 +1,13 @@
 """FMP vendor: client behavior, parsing, look-ahead filtering, routing fallback."""
 
+import copy
 import json
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock, patch
+
+import tradingagents.default_config as default_config
+from tradingagents.dataflows.config import set_config
 
 from tradingagents.dataflows.vendor_errors import VendorRateLimitError
 from tradingagents.dataflows.alpha_vantage_common import AlphaVantageRateLimitError
@@ -219,3 +223,36 @@ def test_fmp_registered_for_all_methods():
     assert "fmp" in VENDOR_LIST
     for method, vendors in VENDOR_METHODS.items():
         assert "fmp" in vendors, f"{method} missing fmp implementation"
+
+
+@pytest.mark.unit
+def test_router_falls_back_from_fmp_to_yfinance(monkeypatch):
+    from tradingagents.dataflows import interface
+    from tradingagents.dataflows.fmp_common import FMPRateLimitError
+
+    # Select fmp as the primary vendor for OHLCV.
+    cfg = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    cfg["data_vendors"]["core_stock_apis"] = "fmp"
+    set_config(cfg)
+
+    def fmp_blocked(*args, **kwargs):
+        raise FMPRateLimitError("plan-gated")
+
+    def yfin_ok(*args, **kwargs):
+        return "YFIN_DATA"
+
+    monkeypatch.setitem(interface.VENDOR_METHODS["get_stock_data"], "fmp", fmp_blocked)
+    monkeypatch.setitem(interface.VENDOR_METHODS["get_stock_data"], "yfinance", yfin_ok)
+    # alpha_vantage is also in the fallback chain before yfinance; block it too
+    # so the router reaches yfinance.
+    monkeypatch.setitem(
+        interface.VENDOR_METHODS["get_stock_data"],
+        "alpha_vantage",
+        fmp_blocked,
+    )
+
+    result = interface.route_to_vendor("get_stock_data", "AAPL", "2024-01-01", "2024-01-31")
+    assert result == "YFIN_DATA"
+
+    # Restore default config for test isolation.
+    set_config(copy.deepcopy(default_config.DEFAULT_CONFIG))
