@@ -109,3 +109,25 @@ def test_fmp_get_stock_empty_raises_no_data(monkeypatch):
     monkeypatch.setattr(fmp_stock, "_make_api_request", lambda endpoint, params=None: [])
     with pytest.raises(NoMarketDataError):
         fmp_stock.get_stock("NOPE", "2024-01-01", "2024-01-31")
+
+
+@pytest.mark.unit
+def test_fmp_get_indicator_uses_fmp_ohlcv(monkeypatch):
+    from tradingagents.dataflows import fmp_indicator
+
+    dates = pd.date_range("2024-01-01", periods=60, freq="D")
+    df = pd.DataFrame(
+        {
+            "Date": dates,
+            "Open": range(100, 160),
+            "High": range(101, 161),
+            "Low": range(99, 159),
+            "Close": range(100, 160),
+            "Volume": [1000] * 60,
+        }
+    )
+    monkeypatch.setattr(fmp_indicator, "load_fmp_ohlcv", lambda symbol, curr_date: df)
+
+    out = fmp_indicator.get_indicator("AAPL", "close_50_sma", "2024-02-29", 3)
+    assert "## close_50_sma values from 2024-02-26 to 2024-02-29:" in out
+    assert "50 SMA" in out
