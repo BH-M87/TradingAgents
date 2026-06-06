@@ -2,6 +2,7 @@
 
 import pytest
 import pandas as pd
+from unittest.mock import MagicMock, patch
 
 from tradingagents.dataflows.vendor_errors import VendorRateLimitError
 from tradingagents.dataflows.alpha_vantage_common import AlphaVantageRateLimitError
@@ -35,3 +36,49 @@ def test_indicator_window_from_frame_formats_window():
     assert "2024-02-29:" in out
     assert "2024-02-26:" in out
     assert "50 SMA" in out  # description appended
+
+
+def _mock_response(status_code=200, json_payload=None):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_payload
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+@pytest.mark.unit
+def test_fmp_no_api_key_raises_not_configured(monkeypatch):
+    from tradingagents.dataflows.fmp_common import _make_api_request, FMPNotConfiguredError
+
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+    with pytest.raises(FMPNotConfiguredError):
+        _make_api_request("profile", {"symbol": "AAPL"})
+
+
+@pytest.mark.unit
+def test_fmp_http_429_raises_rate_limit(monkeypatch):
+    from tradingagents.dataflows.fmp_common import _make_api_request, FMPRateLimitError
+
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
+    with patch("tradingagents.dataflows.fmp_common.requests.get", return_value=_mock_response(429)):
+        with pytest.raises(FMPRateLimitError):
+            _make_api_request("profile", {"symbol": "AAPL"})
+
+
+@pytest.mark.unit
+def test_fmp_premium_error_message_raises_rate_limit(monkeypatch):
+    from tradingagents.dataflows.fmp_common import _make_api_request, FMPRateLimitError
+
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
+    payload = {"Error Message": "Limit Reach . Please upgrade your plan."}
+    with patch("tradingagents.dataflows.fmp_common.requests.get", return_value=_mock_response(200, payload)):
+        with pytest.raises(FMPRateLimitError):
+            _make_api_request("news/stock", {"symbols": "AAPL"})
+
+
+@pytest.mark.unit
+def test_fmp_symbol_normalizes():
+    from tradingagents.dataflows.fmp_common import fmp_symbol
+
+    assert fmp_symbol("aapl+") == "AAPL"
+    assert fmp_symbol("  msft ") == "MSFT"
