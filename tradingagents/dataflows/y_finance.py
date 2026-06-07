@@ -3,10 +3,21 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import pandas as pd
 import yfinance as yf
-import os
-from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date
+from yfinance.exceptions import YFRateLimitError
+from .stockstats_utils import StockstatsUtils, yf_retry, load_ohlcv, filter_financials_by_date
 from .symbol_utils import normalize_symbol, NoMarketDataError
+from .vendor_errors import VendorRateLimitError
+from . import vendor_cooldown
 from .indicators_common import BEST_IND_PARAMS, indicator_window_from_frame
+
+
+def _raise_if_yahoo_cooling() -> None:
+    """Fast-fail a yfinance call when the Yahoo rate-limit breaker is open.
+
+    Skips the doomed ~62s retry backoff so the routing layer fails over to the
+    next vendor immediately (see ``vendor_cooldown``).
+    """
+    vendor_cooldown.raise_if_cooling("yfinance")
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -77,6 +88,8 @@ def get_stock_stats_indicators_window(
         return indicator_window_from_frame(data, indicator, curr_date, look_back_days)
     except NoMarketDataError:
         raise  # Unknown/delisted symbol — let the router emit the sentinel
+    except VendorRateLimitError:
+        raise  # Yahoo throttled — let the router fail over to the next vendor
     except Exception as e:
         print(f"Error getting bulk stockstats data: {e}")
         # Fallback to per-day computation if the bulk path fails.
@@ -118,6 +131,8 @@ def get_stockstats_indicator(
         )
     except NoMarketDataError:
         raise  # Unknown/delisted symbol — let the router emit the sentinel
+    except VendorRateLimitError:
+        raise  # Yahoo throttled — let the router fail over to the next vendor
     except Exception as e:
         print(
             f"Error getting stockstats indicator data for indicator {indicator} on {curr_date}: {e}"
@@ -133,6 +148,7 @@ def get_fundamentals(
 ):
     """Get company fundamentals overview from yfinance."""
     canonical = normalize_symbol(ticker)
+    _raise_if_yahoo_cooling()
     try:
         ticker_obj = yf.Ticker(canonical)
         info = yf_retry(lambda: ticker_obj.info)
@@ -190,6 +206,11 @@ def get_fundamentals(
 
     except NoMarketDataError:
         raise
+    except (VendorRateLimitError, YFRateLimitError) as exc:
+        vendor_cooldown.record_rate_limit("yfinance")
+        raise VendorRateLimitError(
+            f"Yahoo Finance rate limited for {canonical!r}"
+        ) from exc
     except Exception as e:
         return f"Error retrieving fundamentals for {ticker}: {str(e)}"
 
@@ -201,6 +222,7 @@ def get_balance_sheet(
 ):
     """Get balance sheet data from yfinance."""
     canonical = normalize_symbol(ticker)
+    _raise_if_yahoo_cooling()
     try:
         ticker_obj = yf.Ticker(canonical)
 
@@ -225,6 +247,11 @@ def get_balance_sheet(
 
     except NoMarketDataError:
         raise
+    except (VendorRateLimitError, YFRateLimitError) as exc:
+        vendor_cooldown.record_rate_limit("yfinance")
+        raise VendorRateLimitError(
+            f"Yahoo Finance rate limited for {canonical!r}"
+        ) from exc
     except Exception as e:
         return f"Error retrieving balance sheet for {ticker}: {str(e)}"
 
@@ -236,6 +263,7 @@ def get_cashflow(
 ):
     """Get cash flow data from yfinance."""
     canonical = normalize_symbol(ticker)
+    _raise_if_yahoo_cooling()
     try:
         ticker_obj = yf.Ticker(canonical)
 
@@ -260,6 +288,11 @@ def get_cashflow(
 
     except NoMarketDataError:
         raise
+    except (VendorRateLimitError, YFRateLimitError) as exc:
+        vendor_cooldown.record_rate_limit("yfinance")
+        raise VendorRateLimitError(
+            f"Yahoo Finance rate limited for {canonical!r}"
+        ) from exc
     except Exception as e:
         return f"Error retrieving cash flow for {ticker}: {str(e)}"
 
@@ -271,6 +304,7 @@ def get_income_statement(
 ):
     """Get income statement data from yfinance."""
     canonical = normalize_symbol(ticker)
+    _raise_if_yahoo_cooling()
     try:
         ticker_obj = yf.Ticker(canonical)
 
@@ -295,6 +329,11 @@ def get_income_statement(
 
     except NoMarketDataError:
         raise
+    except (VendorRateLimitError, YFRateLimitError) as exc:
+        vendor_cooldown.record_rate_limit("yfinance")
+        raise VendorRateLimitError(
+            f"Yahoo Finance rate limited for {canonical!r}"
+        ) from exc
     except Exception as e:
         return f"Error retrieving income statement for {ticker}: {str(e)}"
 
@@ -304,6 +343,7 @@ def get_insider_transactions(
 ):
     """Get insider transactions data from yfinance."""
     canonical = normalize_symbol(ticker)
+    _raise_if_yahoo_cooling()
     try:
         ticker_obj = yf.Ticker(canonical)
         data = yf_retry(lambda: ticker_obj.insider_transactions)
@@ -321,6 +361,11 @@ def get_insider_transactions(
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         
         return header + csv_string
-        
+
+    except (VendorRateLimitError, YFRateLimitError) as exc:
+        vendor_cooldown.record_rate_limit("yfinance")
+        raise VendorRateLimitError(
+            f"Yahoo Finance rate limited for {canonical!r}"
+        ) from exc
     except Exception as e:
         return f"Error retrieving insider transactions for {ticker}: {str(e)}"

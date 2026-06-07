@@ -15,7 +15,7 @@ from typing import Iterable, Optional
 import pandas as pd
 from stockstats import wrap
 
-from tradingagents.dataflows.stockstats_utils import load_ohlcv
+from tradingagents.dataflows.ohlcv_loader import load_ohlcv_with_fallback
 
 # A fixed, common indicator set so the snapshot is the same shape every run.
 DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (
@@ -28,11 +28,13 @@ DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (
 def _verified_rows(symbol: str, curr_date: str) -> pd.DataFrame:
     """OHLCV on or before curr_date, date-sorted. Raises if nothing usable.
 
-    ``load_ohlcv`` already normalizes the Date column and filters out
-    look-ahead rows, but we re-apply the cutoff defensively — this is a
-    verification path, so it must not trust its input to be pre-filtered.
+    ``load_ohlcv_with_fallback`` already normalizes the Date column and filters
+    out look-ahead rows, but we re-apply the cutoff defensively — this is a
+    verification path, so it must not trust its input to be pre-filtered. The
+    fallback loader sources prices from FMP when Yahoo is rate-limited, so the
+    snapshot stays populated instead of degrading to a placeholder mid-cooldown.
     """
-    data = load_ohlcv(symbol, curr_date)
+    data = load_ohlcv_with_fallback(symbol, curr_date)
     if data is None or data.empty:
         raise ValueError(f"No OHLCV data available for {symbol}.")
 

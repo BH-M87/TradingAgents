@@ -10,6 +10,8 @@ import os
 from .config import get_config
 from .utils import safe_ticker_component
 from .symbol_utils import normalize_symbol, NoMarketDataError
+from .vendor_errors import VendorRateLimitError
+from . import vendor_cooldown
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,10 @@ def yf_retry(func, max_retries=5, base_delay=2.0):
 
     The default of 5 retries backs off 2+4+8+16+32 ≈ 62s, enough to outlast
     a short Yahoo cooldown; the original 3 (≈14s) routinely expired mid-block.
+    When the retries are exhausted the Yahoo rate-limit breaker is tripped so
+    every *other* Yahoo call in this run fails over to the next vendor
+    immediately instead of each re-paying this full backoff (see
+    ``vendor_cooldown``).
     """
     for attempt in range(max_retries + 1):
         try:
@@ -33,6 +39,7 @@ def yf_retry(func, max_retries=5, base_delay=2.0):
                 logger.warning(f"Yahoo Finance rate limited, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
             else:
+                vendor_cooldown.record_rate_limit("yfinance")
                 raise
 
 
@@ -126,6 +133,16 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             data = cached
 
     if data is None:
+        # Yahoo is in a rate-limit cooldown from an earlier 429 this run. Skip
+        # the (doomed, ~62s) download entirely and signal the routing layer to
+        # fail over to the next vendor immediately. Cached symbols never reach
+        # here, so they still serve even while Yahoo is cooling down.
+        if vendor_cooldown.in_cooldown("yfinance"):
+            raise VendorRateLimitError(
+                f"Yahoo Finance in rate-limit cooldown "
+                f"({vendor_cooldown.seconds_remaining('yfinance'):.0f}s remaining)"
+            )
+
         def _download():
             df = yf.download(
                 canonical,
@@ -147,10 +164,13 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             downloaded = yf_retry(_download)
         except YFRateLimitError as exc:
             # Retries exhausted against an active Yahoo cooldown. Surface as a
-            # no-data condition so callers degrade gracefully (vendor fallback /
-            # placeholder) rather than crashing on a vendor-specific exception.
-            raise NoMarketDataError(
-                symbol, canonical, "Yahoo Finance rate limited; retries exhausted"
+            # rate-limit (not "no data") so the routing layer fails over to the
+            # next vendor and never mislabels a throttled symbol as
+            # delisted/invalid. yf_retry already tripped the breaker so the
+            # rest of this run skips Yahoo immediately.
+            vendor_cooldown.record_rate_limit("yfinance")
+            raise VendorRateLimitError(
+                f"Yahoo Finance rate limited for {canonical!r}; retries exhausted"
             ) from exc
         downloaded = _ensure_date_column(downloaded.reset_index())
         # Only cache real data — never persist an empty frame.

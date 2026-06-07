@@ -35,6 +35,20 @@ def _dummy_api_keys(monkeypatch):
         monkeypatch.setenv(env_var, os.environ.get(env_var, "placeholder"))
 
 
+@pytest.fixture(autouse=True)
+def _reset_vendor_cooldown():
+    """Clear the process-global rate-limit breaker around every test.
+
+    The breaker is module-global state; a test that trips it would otherwise
+    make later tests short-circuit Yahoo calls and fail spuriously.
+    """
+    from tradingagents.dataflows import vendor_cooldown
+
+    vendor_cooldown.reset()
+    yield
+    vendor_cooldown.reset()
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()

@@ -232,6 +232,16 @@ class TradingAgentsGraph:
         actual_holding_days)`` or ``(None, None, None)`` if price data is
         unavailable (too recent, delisted, or network error).
         """
+        # Imported locally: the module's top-level import block sits after
+        # non-import statements (already E402), so keep these at point of use.
+        from yfinance.exceptions import YFRateLimitError
+        from tradingagents.dataflows import vendor_cooldown
+
+        # Outcome bookkeeping is best-effort (it retries next run), so honor the
+        # Yahoo breaker: skip the doomed live fetch while Yahoo is cooling down
+        # rather than blocking the start of a run on two more throttled calls.
+        if vendor_cooldown.in_cooldown("yfinance"):
+            return None, None, None
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
             end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
@@ -254,6 +264,16 @@ class TradingAgentsGraph:
             )
             alpha = raw - bench_ret
             return raw, alpha, actual_days
+        except YFRateLimitError as e:
+            # Prime the breaker so the rest of the run (snapshot/OHLCV/news/…)
+            # fails over to the next vendor immediately instead of each waiting
+            # out the full Yahoo retry backoff.
+            vendor_cooldown.record_rate_limit("yfinance")
+            logger.warning(
+                "Yahoo rate limited resolving outcome for %s on %s (will retry next run): %s",
+                ticker, trade_date, e,
+            )
+            return None, None, None
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",

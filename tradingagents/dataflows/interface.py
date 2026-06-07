@@ -1,5 +1,3 @@
-from typing import Annotated
-
 # Import from vendor-specific modules
 from .y_finance import (
     get_YFin_data_online,
@@ -170,6 +168,7 @@ def route_to_vendor(method: str, *args, **kwargs):
             fallback_vendors.append(vendor)
 
     last_no_data: NoMarketDataError | None = None
+    last_rate_limit: VendorRateLimitError | None = None
     first_error: Exception | None = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
@@ -180,8 +179,9 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except VendorRateLimitError:
-            continue  # Rate limits / plan-gated endpoints: try the next vendor
+        except VendorRateLimitError as e:
+            last_rate_limit = e  # Rate limited / plan-gated: try the next vendor
+            continue
         except NoMarketDataError as e:
             last_no_data = e  # No data here; another vendor may have it
             continue
@@ -209,8 +209,20 @@ def route_to_vendor(method: str, *args, **kwargs):
             f"fabricate values — report that data is unavailable for this symbol."
         )
 
-    # No vendor returned data and none reported clean "no data" — surface the
-    # first real error (e.g. the primary vendor's network failure).
+    # A transient rate limit anywhere (e.g. the primary vendor in cooldown)
+    # takes precedence over an incidental fallback error: this is temporary,
+    # not a bad symbol, so degrade to an explicit "try again later" sentinel
+    # rather than crashing the analyst node on, say, a fallback vendor's 5xx.
+    if last_rate_limit is not None:
+        return (
+            "TEMPORARILY_UNAVAILABLE: Every configured data vendor is rate-limited "
+            "right now, so this data could not be fetched. Do not estimate or "
+            "fabricate values — report that the data is temporarily unavailable "
+            "and should be retried later."
+        )
+
+    # No vendor returned data, no rate limit, and none reported clean "no data" —
+    # surface the first real error (e.g. the primary vendor's network failure).
     if first_error is not None:
         raise first_error
 

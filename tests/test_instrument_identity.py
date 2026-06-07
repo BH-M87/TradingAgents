@@ -64,6 +64,45 @@ class ResolveInstrumentIdentityTests(unittest.TestCase):
         mock.assert_called_once()  # second call served from cache
         self.assertEqual(first, second)
 
+    def test_skips_fetch_while_yahoo_cooling(self):
+        # This is typically the run's first Yahoo call: it must honor an open
+        # breaker and not even touch the network.
+        from tradingagents.dataflows import vendor_cooldown
+
+        vendor_cooldown.record_rate_limit("yfinance")
+        with patch("tradingagents.agents.utils.agent_utils.yf.Ticker") as mock:
+            self.assertEqual(resolve_instrument_identity("TOTDY"), {})
+        mock.assert_not_called()
+
+    def test_rate_limit_trips_breaker_without_retry(self):
+        from tradingagents.dataflows import vendor_cooldown
+        from yfinance.exceptions import YFRateLimitError
+
+        with patch(
+            "tradingagents.agents.utils.agent_utils.yf.Ticker",
+            side_effect=YFRateLimitError(),
+        ):
+            self.assertEqual(resolve_instrument_identity("TOTDY"), {})
+        # Breaker primed so downstream Yahoo calls fail over immediately.
+        self.assertTrue(vendor_cooldown.in_cooldown("yfinance"))
+
+    def test_rate_limit_result_not_cached(self):
+        # A transient 429 must NOT be memoized: after the breaker clears, a
+        # later call for the same ticker should fetch again and succeed.
+        from tradingagents.dataflows import vendor_cooldown
+        from yfinance.exceptions import YFRateLimitError
+
+        with patch(
+            "tradingagents.agents.utils.agent_utils.yf.Ticker",
+            side_effect=YFRateLimitError(),
+        ):
+            self.assertEqual(resolve_instrument_identity("TOTDY"), {})
+        vendor_cooldown.reset()
+        with patch("tradingagents.agents.utils.agent_utils.yf.Ticker") as mock:
+            mock.return_value.info = {"longName": "TOTO LTD."}
+            identity = resolve_instrument_identity("TOTDY")
+        self.assertEqual(identity["company_name"], "TOTO LTD.")
+
 
 @pytest.mark.unit
 class BuildInstrumentContextTests(unittest.TestCase):

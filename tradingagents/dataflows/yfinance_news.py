@@ -3,11 +3,14 @@
 from typing import Optional
 
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 from .config import get_config
 from .stockstats_utils import yf_retry
+from .vendor_errors import VendorRateLimitError
+from . import vendor_cooldown
 
 
 def _extract_article_data(article: dict) -> dict:
@@ -68,6 +71,7 @@ def get_news_yfinance(
         Formatted string containing news articles
     """
     article_limit = get_config()["news_article_limit"]
+    vendor_cooldown.raise_if_cooling("yfinance")
     try:
         stock = yf.Ticker(ticker)
         news = yf_retry(lambda: stock.get_news(count=article_limit))
@@ -104,6 +108,11 @@ def get_news_yfinance(
 
         return f"## {ticker} News, from {start_date} to {end_date}:\n\n{news_str}"
 
+    except (VendorRateLimitError, YFRateLimitError) as exc:
+        vendor_cooldown.record_rate_limit("yfinance")
+        raise VendorRateLimitError(
+            f"Yahoo Finance rate limited fetching news for {ticker!r}"
+        ) from exc
     except Exception as e:
         return f"Error fetching news for {ticker}: {str(e)}"
 
@@ -136,6 +145,7 @@ def get_global_news_yfinance(
     all_news = []
     seen_titles = set()
 
+    vendor_cooldown.raise_if_cooling("yfinance")
     try:
         for query in search_queries:
             search = yf_retry(lambda q=query: yf.Search(
@@ -198,5 +208,10 @@ def get_global_news_yfinance(
 
         return f"## Global Market News, from {start_date} to {curr_date}:\n\n{news_str}"
 
+    except (VendorRateLimitError, YFRateLimitError) as exc:
+        vendor_cooldown.record_rate_limit("yfinance")
+        raise VendorRateLimitError(
+            "Yahoo Finance rate limited fetching global news"
+        ) from exc
     except Exception as e:
         return f"Error fetching global news: {str(e)}"

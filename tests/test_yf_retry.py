@@ -15,9 +15,10 @@ import pandas as pd
 import pytest
 from yfinance.exceptions import YFRateLimitError
 
-from tradingagents.dataflows import stockstats_utils
+from tradingagents.dataflows import stockstats_utils, vendor_cooldown
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.symbol_utils import NoMarketDataError
+from tradingagents.dataflows.vendor_errors import VendorRateLimitError
 
 
 def _good_frame():
@@ -36,6 +37,8 @@ class TestLoadOhlcvRateLimit(unittest.TestCase):
         set_config({"data_cache_dir": self._tmp})
         self._sleep = mock.patch.object(stockstats_utils.time, "sleep").start()
         self.addCleanup(mock.patch.stopall)
+        vendor_cooldown.reset()
+        self.addCleanup(vendor_cooldown.reset)
 
     def tearDown(self):
         for f in os.listdir(self._tmp):
@@ -61,13 +64,28 @@ class TestLoadOhlcvRateLimit(unittest.TestCase):
         self.assertTrue(self._sleep.called)
         self.assertFalse(df.empty)
 
-    def test_swallowed_rate_limit_exhausts_raises_no_market_data(self):
+    def test_swallowed_rate_limit_exhausts_raises_vendor_rate_limit(self):
+        # Exhausted retries against an active Yahoo cooldown must surface as a
+        # VendorRateLimitError (so the router fails over to the next vendor and
+        # never mislabels a throttled symbol as delisted) and must trip the
+        # breaker so the rest of the run skips Yahoo.
         with mock.patch.object(stockstats_utils, "_download_was_rate_limited", return_value=True), \
              mock.patch.object(stockstats_utils.yf, "download", return_value=pd.DataFrame()):
-            with self.assertRaises(NoMarketDataError):
+            with self.assertRaises(VendorRateLimitError):
                 stockstats_utils.load_ohlcv("MU", "2026-01-05")
         # Retried up to the configured ceiling before giving up.
         self.assertTrue(self._sleep.call_count >= 3)
+        self.assertTrue(vendor_cooldown.in_cooldown("yfinance"))
+
+    def test_cooldown_short_circuits_subsequent_download(self):
+        # Once the breaker is open, a fresh (uncached) symbol must fail over
+        # instantly — no download attempt, no backoff sleep.
+        vendor_cooldown.record_rate_limit("yfinance")
+        with mock.patch.object(stockstats_utils.yf, "download") as dl:
+            with self.assertRaises(VendorRateLimitError):
+                stockstats_utils.load_ohlcv("NVDA", "2026-01-05")
+        self.assertFalse(dl.called)
+        self.assertFalse(self._sleep.called)
 
     def test_raised_rate_limit_retries_then_succeeds(self):
         calls = {"n": 0}

@@ -3,7 +3,10 @@ import logging
 from typing import Any, Mapping, Optional
 
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 from langchain_core.messages import HumanMessage, RemoveMessage
+
+from tradingagents.dataflows import vendor_cooldown
 
 # Import tools from separate utility files
 from tradingagents.agents.utils.core_stock_tools import (
@@ -57,25 +60,14 @@ def _clean_identity_value(value: Any) -> Optional[str]:
 
 
 @functools.lru_cache(maxsize=256)
-def resolve_instrument_identity(ticker: str) -> dict:
-    """Resolve deterministic identity metadata (company name, sector, …) for a ticker.
+def _resolve_instrument_identity_cached(ticker: str) -> dict:
+    """Fetch identity metadata from yfinance. Raises on fetch failure.
 
-    This exists to stop the pipeline from hallucinating a *different* company
-    when a chart pattern suggests a different industry than the real one
-    (#814): without a ground-truth name, the market analyst would pattern-match
-    the price action to a narrative and invent an identity that then cascaded
-    through every downstream agent.
-
-    Best-effort by design: if yfinance is unavailable, rate-limited, or doesn't
-    recognise the ticker, we return ``{}`` and the caller falls back to
-    ticker-only context rather than failing before analysis starts. Cached so
-    the lookup happens at most once per ticker per process.
+    Kept separate from the public wrapper so a transient rate-limit (which
+    raises) is NOT memoized — only successful lookups and genuine
+    "unknown ticker" stubs (which return ``{}`` without raising) are cached.
     """
-    try:
-        info = yf.Ticker(ticker.upper()).info or {}
-    except Exception as exc:  # noqa: BLE001 — fail open, never block the run
-        logger.debug("Could not resolve instrument identity for %s: %s", ticker, exc)
-        return {}
+    info = yf.Ticker(ticker.upper()).info or {}
 
     identity: dict[str, str] = {}
     company_name = _clean_identity_value(info.get("longName")) or _clean_identity_value(
@@ -93,6 +85,49 @@ def resolve_instrument_identity(ticker: str) -> dict:
         if value:
             identity[target_key] = value
     return identity
+
+
+def resolve_instrument_identity(ticker: str) -> dict:
+    """Resolve deterministic identity metadata (company name, sector, …) for a ticker.
+
+    This exists to stop the pipeline from hallucinating a *different* company
+    when a chart pattern suggests a different industry than the real one
+    (#814): without a ground-truth name, the market analyst would pattern-match
+    the price action to a narrative and invent an identity that then cascaded
+    through every downstream agent.
+
+    Best-effort by design: if yfinance is unavailable, rate-limited, or doesn't
+    recognise the ticker, we return ``{}`` and the caller falls back to
+    ticker-only context rather than failing before analysis starts. Successful
+    lookups are cached so the fetch happens at most once per ticker per process.
+
+    This is typically the FIRST Yahoo call of a run, so it participates in the
+    rate-limit breaker: it skips the doomed ``.info`` fetch while Yahoo is in
+    cooldown, and trips the breaker on a 429 so every downstream Yahoo call
+    fails over to the next vendor immediately rather than each re-paying the
+    retry backoff (the cause of the multi-minute "Yahoo timed out" stalls).
+    """
+    # Honor an open breaker without caching the empty result (a later,
+    # post-cooldown call for the same ticker can then still succeed).
+    if vendor_cooldown.in_cooldown("yfinance"):
+        return {}
+    try:
+        return _resolve_instrument_identity_cached(ticker)
+    except YFRateLimitError as exc:
+        # Single .info attempt 429'd: prime the breaker so the rest of the run
+        # fails over fast. No retry here — this best-effort lookup must not add
+        # a backoff wait to the start of every run.
+        vendor_cooldown.record_rate_limit("yfinance")
+        logger.debug("Instrument identity for %s rate-limited; tripping breaker: %s", ticker, exc)
+        return {}
+    except Exception as exc:  # noqa: BLE001 — fail open, never block the run
+        logger.debug("Could not resolve instrument identity for %s: %s", ticker, exc)
+        return {}
+
+
+# Preserve the cache-management API on the public name (callers and tests use
+# ``resolve_instrument_identity.cache_clear()``).
+resolve_instrument_identity.cache_clear = _resolve_instrument_identity_cached.cache_clear
 
 
 def build_instrument_context(
